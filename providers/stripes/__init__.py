@@ -71,7 +71,6 @@ class StripeProvider(PaymentProvider):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self._webhook_secret: str = ""
-        self._products: dict[str, dict[str, Any]] = {}
         self._handlers: dict[str, list[Callable]] = {}
 
     # ------------------------------------------------------------------
@@ -88,13 +87,12 @@ class StripeProvider(PaymentProvider):
 
         _stripe.api_key = secret_key
         self._webhook_secret = self._config.get("webhook_secret", "")
-        self._products = self._config.get("products", {})
 
         # Vérification de la connexion API
         await _stripe.Account.retrieve_async()
 
         self._ready = True
-        logger.info("[stripe] prêt (domain=%s, produits=%s)", self._domain(), list(self._products))
+        logger.info("[stripe] prêt (domain=%s)", self._domain())
 
     async def _shutdown(self) -> None:
         self._ready = False
@@ -115,7 +113,6 @@ class StripeProvider(PaymentProvider):
             "name": self.name,
             "status": "ready" if self._ready else "uninitialized",
             "domain": self._domain(),
-            "products": list(self._products.keys()),
             "webhook_handlers": {
                 evt: len(handlers)
                 for evt, handlers in self._handlers.items()
@@ -126,6 +123,31 @@ class StripeProvider(PaymentProvider):
     # Paiements one-time
     # ------------------------------------------------------------------
 
+    def _callback_url(self, path: str, with_session: bool = False) -> str:
+        """Construit une URL de retour Stripe.
+
+        - chemin relatif ("/success") → joint au domaine configuré ;
+        - URL absolue ("https://...") → utilisée telle quelle.
+
+        Stripe n'accepte que http(s) : un schéma custom (erp://, app://) est
+        refusé. On lève une erreur explicite plutôt que de laisser Stripe
+        répondre « Not a valid URL ». Pour un deep-link, passez par une page
+        https intermédiaire qui redirige ensuite vers votre schéma.
+        """
+        from urllib.parse import urlsplit
+
+        url = path if urlsplit(path).scheme else f"{self._domain()}/{path.lstrip('/')}"
+        if urlsplit(url).scheme not in ("http", "https"):
+            raise ValueError(
+                f"[stripe] URL de retour invalide '{url}' : Stripe exige http(s). "
+                "Pour un deep-link (erp://, app://), utilisez une page https "
+                "intermédiaire qui redirige vers votre schéma."
+            )
+        if with_session:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}session_id={{CHECKOUT_SESSION_ID}}"
+        return url
+
     async def create_checkout(
         self,
         product_id: str,
@@ -135,28 +157,59 @@ class StripeProvider(PaymentProvider):
     ) -> CheckoutResult:
         self._require_ready()
 
-        product = self._get_product(product_id)
+        # product_id est un identifiant Stripe (prod_xxx), fourni par xlicense
+        # (source de vérité). On règle le paiement sur le prix par défaut du
+        # produit : aucun catalogue local n'est nécessaire.
+        product = await _stripe.Product.retrieve_async(product_id)
+        price_id = product.get("default_price")
+        if not price_id:
+            raise ValueError(
+                f"[stripe] Le produit '{product_id}' n'a pas de prix par défaut "
+                "(default_price). Configurez-le dans Stripe."
+            )
         session = await _stripe.checkout.Session.create_async(
             payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": product.get("currency", "usd"),
-                    "product_data": {"name": product["name"]},
-                    "unit_amount": int(product["amount"]),
-                },
-                "quantity": 1,
-            }],
+            line_items=[{"price": price_id, "quantity": 1}],
             mode="payment",
-            success_url=f"{self._domain()}{success_path}?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{self._domain()}{cancel_path}",
+            success_url=self._callback_url(success_path, with_session=True),
+            cancel_url=self._callback_url(cancel_path),
             metadata=metadata or {},
         )
         return CheckoutResult(
             url=session.url,
             session_id=session.id,
             provider=self.name,
-            metadata={"product_id": product_id},
+            metadata={"product_id": product_id, "price_id": price_id},
         )
+
+    async def list_catalog(self) -> list[dict[str, Any]]:
+        """Liste les produits Stripe actifs avec leur prix par défaut.
+
+        Renvoie pour chaque produit : product_id, name, price_id (du
+        default_price) et price_type ('recurring' | 'one_time' | None).
+        Sert au seed xpayproxy qui synchronise le mapping plan→Stripe en DB.
+        """
+        self._require_ready()
+
+        resp = await _stripe.Product.list_async(
+            active=True, limit=100, expand=["data.default_price"]
+        )
+        catalog: list[dict[str, Any]] = []
+        for prod in resp.data:
+            price = prod.get("default_price")
+            if isinstance(price, dict):
+                price_id = price.get("id")
+                price_type = price.get("type")
+            else:
+                price_id = price  # juste l'id, non étendu
+                price_type = None
+            catalog.append({
+                "product_id": prod.get("id"),
+                "name": prod.get("name"),
+                "price_id": price_id,
+                "price_type": price_type,
+            })
+        return catalog
 
     async def verify_payment(self, session_id: str) -> PaymentStatus:
         self._require_ready()
@@ -192,8 +245,8 @@ class StripeProvider(PaymentProvider):
             payment_method_types=["card"],
             line_items=[{"price": price_id, "quantity": 1}],
             mode="subscription",
-            success_url=f"{self._domain()}{success_path}?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{self._domain()}{cancel_path}",
+            success_url=self._callback_url(success_path, with_session=True),
+            cancel_url=self._callback_url(cancel_path),
             metadata=metadata or {},
         )
         return CheckoutResult(
@@ -284,7 +337,7 @@ class StripeProvider(PaymentProvider):
 
         portal = await _stripe.billing_portal.Session.create_async(
             customer=customer["id"],
-            return_url=f"{self._domain()}{return_path}",
+            return_url=self._callback_url(return_path),
         )
         return portal.url
 
@@ -346,13 +399,6 @@ class StripeProvider(PaymentProvider):
     # Helpers privés
     # ------------------------------------------------------------------
 
-    def _get_product(self, product_id: str) -> dict[str, Any]:
-        if product_id not in self._products:
-            raise ValueError(
-                f"[stripe] Produit inconnu : '{product_id}'. "
-                f"Disponibles : {sorted(self._products)}"
-            )
-        return self._products[product_id]
 
     async def _find_customer(self, email: str) -> dict[str, Any] | None:
         result = await _stripe.Customer.list_async(email=email, limit=1)
