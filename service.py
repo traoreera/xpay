@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from rich import print_json
 from xcore.sdk import get_logger
 from xcore.services.base import BaseService, ServiceStatus
 
