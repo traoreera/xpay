@@ -248,6 +248,12 @@ class StripeProvider(PaymentProvider):
             success_url=self._callback_url(success_path, with_session=True),
             cancel_url=self._callback_url(cancel_path),
             metadata=metadata or {},
+            # Sans ceci, l'objet Subscription créé par Stripe a un metadata VIDE
+            # (metadata=... ci-dessus ne le pose que sur la Session) — tenant_id/
+            # license_id étaient alors introuvables dans les handlers
+            # subscription.created/subscription.updated, qui lisent le metadata
+            # de l'abonnement, pas de la session (audit xpayproxy Constat 5, bug 1).
+            subscription_data={"metadata": metadata or {}},
         )
         return CheckoutResult(
             url=session.url,
