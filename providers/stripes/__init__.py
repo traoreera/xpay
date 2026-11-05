@@ -80,16 +80,29 @@ class StripeProvider(PaymentProvider):
     async def _init(self) -> None:
         secret_key = self._config.get("secret_key")
         if not secret_key:
-            raise ValueError(
-                "[stripe] 'secret_key' manquant. "
-                "Ajoutez config.secret_key dans xcore.yaml."
+            # Mode dégradé : le backend démarre sans paiement en ligne ; chaque appel
+            # de paiement échoue ensuite avec un message explicite (_require_ready).
+            logger.warning(
+                "[stripe] 'secret_key' manquant : paiement en ligne désactivé. "
+                "Renseignez STRIPE_SECRET_KEY pour l'activer."
             )
+            self._ready = False
+            return
 
         _stripe.api_key = secret_key
         self._webhook_secret = self._config.get("webhook_secret", "")
 
-        # Vérification de la connexion API
-        await _stripe.Account.retrieve_async()
+        # Vérification de la connexion API : une panne réseau ou une clé refusée ne doit
+        # pas empêcher le démarrage du reste de l'ERP.
+        try:
+            await _stripe.Account.retrieve_async()
+        except Exception as exc:  # noqa: BLE001 - toute erreur Stripe/réseau = mode dégradé
+            logger.warning(
+                "[stripe] API injoignable ou clé refusée : paiement en ligne désactivé (%s)",
+                type(exc).__name__,
+            )
+            self._ready = False
+            return
 
         self._ready = True
         logger.info("[stripe] prêt (domain=%s)", self._domain())
@@ -168,7 +181,9 @@ class StripeProvider(PaymentProvider):
                 "(default_price). Configurez-le dans Stripe."
             )
         session = await _stripe.checkout.Session.create_async(
-            payment_method_types=["card"],
+            # `payment_method_types` n'est plus accepté par l'API Checkout : les moyens de paiement se
+            # règlent dans le tableau de bord du compte (« dynamic payment methods »). Le passer fait
+            # échouer TOUTE création de session — mesuré contre l'API réelle le 3 nov. 2026.
             line_items=[{"price": price_id, "quantity": 1}],
             mode="payment",
             success_url=self._callback_url(success_path, with_session=True),
@@ -215,14 +230,26 @@ class StripeProvider(PaymentProvider):
         self._require_ready()
 
         session = await _stripe.checkout.Session.retrieve_async(session_id)
-        paid = session.payment_status == "paid"
+        d = session.to_dict() if hasattr(session, "to_dict") else dict(session)
+        paid = d.get("payment_status") == "paid"
+        # Les métadonnées de la SESSION sont rendues telles quelles : c'est par elles que l'appelant
+        # reconnaît ce qui a été acheté (pour qui, quel article), et c'est la seule chose qu'il puisse
+        # croire — le navigateur, lui, n'apporte qu'un identifiant de session. Les écraser par le seul
+        # `stripe_session` rendait toute vérification impossible : l'appelant ne pouvait que refuser.
+        meta = dict(d.get("metadata") or {})
+        meta["stripe_session"] = d.get("id")
+        # L'abonnement créé par une session `mode=subscription` : sans lui, l'appelant devait le
+        # rechercher par l'adresse du client, un détour qui échoue dès qu'un compte a plusieurs abonnements.
+        if d.get("subscription"):
+            meta["subscription_id"] = d["subscription"]
+        details = d.get("customer_details") or {}
         return PaymentStatus(
             paid=paid,
             session_id=session_id,
-            customer_email=session.customer_details.email if paid else None,
-            amount=session.amount_total,
-            currency=session.currency,
-            metadata={"stripe_session": session.id},
+            customer_email=details.get("email") if paid else None,
+            amount=d.get("amount_total"),
+            currency=d.get("currency"),
+            metadata=meta,
         )
 
     # ------------------------------------------------------------------
@@ -242,7 +269,9 @@ class StripeProvider(PaymentProvider):
         customer = await self.get_or_create_customer(customer_email)
         session = await _stripe.checkout.Session.create_async(
             customer=customer["id"],
-            payment_method_types=["card"],
+            # `payment_method_types` n'est plus accepté par l'API Checkout : les moyens de paiement se
+            # règlent dans le tableau de bord du compte (« dynamic payment methods »). Le passer fait
+            # échouer TOUTE création de session — mesuré contre l'API réelle le 3 nov. 2026.
             line_items=[{"price": price_id, "quantity": 1}],
             mode="subscription",
             success_url=self._callback_url(success_path, with_session=True),
@@ -261,6 +290,28 @@ class StripeProvider(PaymentProvider):
             provider=self.name,
             metadata={"price_id": price_id, "customer_email": customer_email},
         )
+
+    async def get_price(self, price_id: str) -> dict[str, Any]:
+        """Le tarif tel que le prestataire le connaît : c'est LUI qui dit ce qui sera débité.
+
+        Un catalogue local qui porterait un montant de son côté finirait par mentir — annoncer 19,99 € et
+        prélever 1 000 € est précisément ce qui arrive quand les deux vivent séparément.
+        """
+        self._require_ready()
+
+        price = await _stripe.Price.retrieve_async(price_id)
+        d = price.to_dict() if hasattr(price, "to_dict") else dict(price)
+        recurring = d.get("recurring") or {}
+        amount = d.get("unit_amount")
+        return {
+            "price_id": d.get("id"),
+            # Stripe compte en centimes ; le reste de la plateforme en unités.
+            "amount": (amount / 100) if isinstance(amount, (int, float)) else None,
+            "currency": (d.get("currency") or "").upper() or None,
+            "interval": recurring.get("interval"),
+            "recurring": bool(recurring),
+            "active": bool(d.get("active")),
+        }
 
     async def get_subscription(self, customer_email: str) -> SubscriptionStatus:
         self._require_ready()

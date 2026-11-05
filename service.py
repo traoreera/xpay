@@ -123,3 +123,30 @@ class PayProvider(BaseService):
     async def unsubcribe(self, id: str, imediatly: bool = False) -> SubscriptionStatus:
 
         return await self.provider.cancel_subscription(id, imediatly)
+
+    async def price(self, price_id: str) -> dict[str, Any]:
+        """Ce qu'un tarif facture réellement. L'autorité sur l'argent est chez le prestataire."""
+        return await self.provider.get_price(price_id)
+
+    def webhook(self, payload: bytes, signature: str):
+        """Vérifie la signature d'un événement du prestataire et le normalise.
+
+        C'est la SEULE porte d'entrée digne de confiance pour un événement : le corps arrive
+        d'Internet, et seule la signature dit qu'il vient bien du prestataire. Lève si elle est
+        absente ou invalide — l'appelant doit alors refuser, jamais deviner.
+        """
+        return self.provider.parse_webhook(payload, signature)
+
+    async def subscription(self, customer_email: str) -> SubscriptionStatus:
+        """L'abonnement actif d'un client. Les fournisseurs l'implémentaient sans que le service
+        l'expose : un appelant pouvait OUVRIR un abonnement sans jamais pouvoir le relire (ni en
+        retenir l'identifiant, que `verify()` ne rend pas pour une session d'abonnement)."""
+        return await self.provider.get_subscription(customer_email)
+
+    async def portal(self, customer_email: str, return_path: str = "/dashboard") -> str:
+        """L'espace de gestion du client chez le prestataire (changer de carte, résilier).
+
+        C'est la sortie honnête pour une résiliation : elle a lieu chez celui qui encaisse, et
+        l'abonné garde sa période déjà réglée.
+        """
+        return await self.provider.create_portal(customer_email, return_path)
